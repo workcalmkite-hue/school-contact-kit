@@ -685,8 +685,20 @@ def main():
                     }}""", arg=[needle, n_before], timeout=25000)
             except Exception:
                 ok = False
+            # 화면이 늦게 그려져 «안 나갔다» 로 읽히는 일이 있었다 → 방을 새로 열어 한 번 더 센다.
+            # 그래도 안 보이면 «확인 안 됨» 으로만 알린다. 다시 보내지는 않는다.
+            if not ok:
+                pg.wait_for_timeout(3000)
+                open_room(pg, room, expect)
+                try:
+                    pg.wait_for_function(f"() => ({bubbles})().some(t => /^\\d{{1,2}}:\\d{{2}}$/.test(t))",
+                                         timeout=12000)
+                except Exception:
+                    pass
+                ok = pg.evaluate(count_js, needle) > n_before
+                result["확인방법"] = "방을 새로 열어 다시 셈"
 
-            result |= {"보냄": ok,
+            result |= {"보냄": ok if ok else "확인 안 됨 — 다시 보내지 말고 --read 로 방을 읽어 확인",
                        "확인": f"{pg.evaluate(count_js, needle)}건"
                                f" (보내기 전 {n_before}건)",
                        "초": round(time.time() - t0, 1)}
