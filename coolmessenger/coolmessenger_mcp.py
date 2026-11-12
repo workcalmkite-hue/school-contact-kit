@@ -17,6 +17,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
+# numpy·PIL 은 서버 시작 때 메인 스레드에서 미리 불러 둔다.
+# 발송 도중(작업 스레드)에 처음 import 하다가 numpy 확장 모듈 로딩에서 영영 멈춘 적이 있다
+# (2026-10-28 py-spy 실측: _match_template 의 import numpy 에서 20분 넘게 정지 → 세션 전체가 멈춤).
+import numpy  # noqa: F401
+from PIL import Image, ImageGrab  # noqa: F401
+
 server = Server("coolmessenger")
 
 # ── Win32 DLL 래퍼 (64비트 포인터 안전) ────────────────────────────────────
@@ -133,7 +139,256 @@ def get_window_by_title(pid: int, title: str):
     return results[0] if results else None
 
 
+# ── 조용한 입력 (2026-11-12) ─────────────────────────────────────────────────
+# 사용자 지시: «내가 마우스 쓰고 있잖아» — 발송 중에 **진짜 마우스·키보드를 쓰지 않는다.**
+# 전부 «그 창에만 가는 메시지»(PostMessage)와 UI 자동화(UIA) 읽기로 한다. 실측(2026-11-12):
+#   · 본문(Chromium 편집기): WM_CHAR 를 Chrome_RenderWidgetHostHWND 에 보내면 창이 뒤에 있어도 들어간다.
+#     단 편집기가 «안쪽 포커스»를 잃었으면(툴바를 누른 뒤 등) 글자가 버려진다 → 편집기에 메시지 클릭을 먼저 준다
+#   · 본문 되읽기: UIA TextPattern (Ctrl+A·Ctrl+C 불필요). 줄바꿈은 WM_CHAR 13
+#   · 받는사람 입력란(RichEdit20W): WM_CHAR 로 이름 → 자동완성 뜸 → WM_KEYDOWN ↓·Enter 로 칩 생성
+#   · 「예약전송」 오너드로우 체크: 메시지 클릭(WM_LBUTTONDOWN/UP)으로 꺼진다, 칩도 안 지워진다
+#     (UIA Invoke 는 되지만 전송창이 앞으로 튀어나와 키보드를 뺏는다 → 쓰지 않는다)
+#   · 굵게: 범위를 메시지 드래그로 고르고 「진하게」 버튼에 메시지 클릭 → 된다
+#   · ⚠️ 빨간색은 아직 안 된다 — 색 팔레트가 진짜 커서 위치(GetCursorPos)로 칸을 고르는 듯, 메시지 클릭은 닫히기만 한다
+#   · UIA SetValue·WM_PASTE 는 본문에 안 먹는다 (둘 다 실측)
+# 진짜 입력이 필요한 옛 경로(전 교직원 발송 등)는 QUIET 일 때 InputNeeded 로 멈춘다.
+# 꼭 옛 방식이 필요하면 환경변수 COOL_ALLOW_INPUT=1.
+QUIET = os.environ.get("COOL_ALLOW_INPUT") != "1"
+
+
+class InputNeeded(RuntimeError):
+    pass
+
+
+def _no_input(what: str):
+    raise InputNeeded("%s 은(는) 진짜 마우스·키보드가 필요해서 멈췄습니다 (사용자 작업 방해 금지). "
+                      "꼭 필요하면 COOL_ALLOW_INPUT=1 로 다시 실행하세요." % what)
+
+
+def _lp(x: int, y: int) -> int:
+    return win32api.MAKELONG(max(0, int(x)), max(0, int(y)))
+
+
+def post_click(hwnd, x=None, y=None) -> None:
+    """그 창에만 «여기를 눌렀다» 메시지를 보낸다. 진짜 커서는 안 움직인다. x,y 는 클라이언트 좌표."""
+    _, _, r, b = win32gui.GetClientRect(hwnd)
+    x = r // 2 if x is None else x
+    y = b // 2 if y is None else y
+    win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, _lp(x, y))
+    time.sleep(0.03)
+    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, _lp(x, y))
+    time.sleep(0.05)
+    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, _lp(x, y))
+    time.sleep(0.15)
+
+
+def post_drag(hwnd, p1, p2) -> None:
+    win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, _lp(*p1))
+    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, _lp(*p1))
+    time.sleep(0.05)
+    win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, _lp(*p2))
+    time.sleep(0.05)
+    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, _lp(*p2))
+    time.sleep(0.2)
+
+
+def post_key(hwnd, vk: int, scan: int) -> None:
+    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk, 1 | (scan << 16))
+    if vk == 0x0D:
+        # Enter 는 keydown 만으로는 줄이 안 바뀌어 WM_CHAR 13 을 같이 보낸다.
+        # «두 번 바뀌지 않나» — 2026-11-12 전송창을 PrintWindow 로 찍어 '첫줄/둘째줄/(빈 줄)/넷째줄' 그대로인 것 확인
+        win32gui.PostMessage(hwnd, win32con.WM_CHAR, 13, 1 | (scan << 16))
+    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, 1 | (scan << 16) | 0xC0000000)
+
+
+def post_chars(hwnd, text: str) -> None:
+    """글자를 그 창에 WM_CHAR 로 보낸다. 줄바꿈은 Enter(13). 이모지 같은 4바이트 글자는 UTF-16 둘로 나눠 보낸다."""
+    text = text.replace("\r\n", "\n")
+    for ch in text:
+        if ch == "\n":
+            post_key(hwnd, 0x0D, 0x1C)
+            continue
+        units = ch.encode("utf-16-le")
+        for i in range(0, len(units), 2):
+            win32gui.PostMessage(hwnd, win32con.WM_CHAR, int.from_bytes(units[i:i + 2], "little"), 1)
+
+
+_UIA = threading.local()   # COM 객체는 스레드마다 따로 (발송은 작업 스레드에서 돈다)
+_BOLD = threading.local()  # 이번 본문에서 굵게를 못 한 말 (quiet_paste_body 가 채운다)
+
+
+def _uia():
+    if getattr(_UIA, "v", None) is None:
+        import comtypes
+        import comtypes.client
+        try:
+            comtypes.CoInitialize()
+        except OSError:
+            pass
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen import UIAutomationClient as U
+        _UIA.v = (comtypes.client.CreateObject(U.CUIAutomation, interface=U.IUIAutomation), U)
+    return _UIA.v
+
+
+def _body_textpattern(send_hwnd: int):
+    """본문 편집기(iframe 문서)의 TextPattern. 문서 요소 중 AutomationId 가 빈 것이 편집 영역이다 (2026-11-12 실측)."""
+    uia, U = _uia()
+    els = uia.ElementFromHandle(send_hwnd).FindAll(U.TreeScope_Descendants, uia.CreateTrueCondition())
+    for i in range(els.Length):
+        e = els.GetElement(i)
+        if e.CurrentControlType == 50030 and e.CurrentAutomationId == "":
+            p = e.GetCurrentPattern(10014)
+            if p:
+                return p.QueryInterface(U.IUIAutomationTextPattern)
+    return None
+
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").replace("\xa0", " ").split())
+
+
+def _body_text(send_hwnd: int) -> str:
+    try:
+        tp = _body_textpattern(send_hwnd)
+        return tp.DocumentRange.GetText(-1) if tp else ""
+    except Exception:
+        return ""
+
+
+def _focus_body_end(send_hwnd: int) -> int:
+    """편집기 빈 아래쪽을 메시지로 눌러 안쪽 포커스를 주고 커서를 끝으로 보낸다."""
+    rw = find_body_target(send_hwnd)
+    _, _, r, b = win32gui.GetClientRect(rw)
+    post_click(rw, r // 2, max(1, b - 8))
+    time.sleep(0.15)
+    return rw
+
+
+def _bold_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
+    """본문에서 span 을 메시지 드래그로 골라 「진하게」를 누른다. 굵게 됐으면 True."""
+    tp = _body_textpattern(send_hwnd)
+    if not tp:
+        return False
+    rg = tp.DocumentRange
+    found = None
+    for _ in range(occurrence + 1):
+        found = rg.FindText(span, 0, 0)
+        if not found:
+            return False
+        rg = tp.DocumentRange
+        rg.MoveEndpointByRange(0, found, 1)    # 다음 찾기는 이 뒤부터 (Start ← found.End)
+    rects = list(found.GetBoundingRectangles())
+    if len(rects) < 4:
+        return False
+    rw = find_body_target(send_hwnd)
+    first, last = rects[:4], rects[-4:]
+    p1 = win32gui.ScreenToClient(rw, (int(first[0]) + 1, int(first[1] + first[3] / 2)))
+    p2 = win32gui.ScreenToClient(rw, (int(last[0] + last[2]) - 1, int(last[1] + last[3] / 2)))
+    post_drag(rw, p1, p2)
+    sel = tp.GetSelection()
+    if not sel.Length or _norm(sel.GetElement(0).GetText(-1)) != _norm(span):
+        return False
+    post_click(_find_child_by_id(send_hwnd, 70001))       # 「진하게」
+    time.sleep(0.2)
+    try:
+        return int(found.GetAttributeValue(40007)) >= 600  # FontWeight
+    except Exception:
+        return False
+
+
+def quiet_paste_body(send_hwnd: int, body: str) -> bool:
+    """본문을 메시지로만 넣는다. **본문 전체가 실제로 들어갔는지** UIA 로 되읽어 확인한다.
+    `**강조**` 는 굵게만 한다 (빨간색은 아직 못 한다 — 위 「조용한 입력」 설명)."""
+    plain, _html = body_markup(body)
+    # (강조할 말, 평문에서 그 말이 몇 번째로 나오는지). 표시 없이 앞에 같은 말이 있어도 맞는 자리를 고른다
+    spans = []
+    for i, m in enumerate(_RED.finditer(body)):
+        at = m.start() - 4 * i                      # 앞선 ** ** 들을 뺀 평문 위치
+        spans.append((m.group(1), plain[:at].count(m.group(1))))
+    want = _norm(plain)
+    if not want:
+        return False
+    for attempt in range(2):
+        rw = _focus_body_end(send_hwnd)
+        if _norm(_body_text(send_hwnd)):
+            return False          # 빈 편집기가 아니면 덮어쓰지 않는다 (지울 방법이 키보드뿐)
+        post_chars(rw, plain)
+        if _wait_for(lambda: _norm(_body_text(send_hwnd)) == want, 2.0 + len(plain) * 0.01, 0.1):
+            break
+        if _norm(_body_text(send_hwnd)):
+            return False          # 일부만 들어갔다 — 보내지 않게 실패로
+    else:
+        return False
+    _BOLD.missed = []
+    for s, nth in spans:
+        for _try in range(3):          # 가끔 첫 드래그가 안 먹는다 (2026-11-12 녹화 때 한 번) — 굵게 됐는지 보고 다시
+            if _bold_span(send_hwnd, s, nth):
+                break
+            _focus_body_end(send_hwnd)
+            time.sleep(0.3)
+        else:
+            _BOLD.missed.append(s)     # 세 번 다 안 됐다 — 보내는 쪽에서 멈춘다
+    if spans:
+        _focus_body_end(send_hwnd)   # 선택 풀기 + 커서를 끝으로 (이모티콘이 끝에 붙게)
+    return _norm(_body_text(send_hwnd)) == want
+
+
+def _settle_checks(send_hwnd: int, still: float = 1.0, timeout: float = 4.0) -> None:
+    """「예약전송」「나에게 보내기」 체크가 still 초 동안 안 바뀔 때까지 기다린다."""
+    def state():
+        return tuple(win32gui.GetWindowText(_find_child_by_id(send_hwnd, i) or 0) if _find_child_by_id(send_hwnd, i) else ""
+                     for i in (1660, 1661))
+    end = time.perf_counter() + timeout
+    last, since = state(), time.perf_counter()
+    while time.perf_counter() < end:
+        time.sleep(0.1)
+        cur = state()
+        if cur != last or "" in cur:
+            last, since = cur, time.perf_counter()
+        elif time.perf_counter() - since >= still:
+            return
+
+
+def fg_guard():
+    """발송 전에 앞에 있던 창을 기억해 두고, 쿨메신저가 앞을 가져갔으면 되돌려 주는 함수를 돌려준다."""
+    u = ctypes.windll.user32
+    orig = u.GetForegroundWindow()
+    try:
+        orig_pid = win32process.GetWindowThreadProcessId(orig)[1]
+    except Exception:
+        orig_pid = 0
+
+    def give_back():
+        fg = u.GetForegroundWindow()
+        if not orig or fg == orig or not win32gui.IsWindow(orig):
+            return
+        try:
+            cool = win32process.GetWindowThreadProcessId(fg)[1] == find_coolmessenger_pid()
+        except Exception:
+            cool = False
+        if not cool or orig_pid == find_coolmessenger_pid():
+            return
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        t = u.GetWindowThreadProcessId(fg, None)
+        u.AttachThreadInput(cur, t, True)
+        try:
+            u.SetForegroundWindow(orig)
+            u.BringWindowToTop(orig)
+        finally:
+            u.AttachThreadInput(cur, t, False)
+    return give_back
+
+
 def bring_to_front(hwnd) -> bool:
+    """hwnd 를 맨 앞(키보드 입력을 받는 창)으로 꺼낸다. 실제로 앞에 나왔으면 True.
+    QUIET 에서는 아무것도 안 한다 — 앞으로 꺼내면 사용자가 치던 글자가 그 창으로 들어간다 (2026-11-12 실제로 들어감)."""
+    if QUIET:
+        return False
+    return _bring_to_front(hwnd)
+
+
+def _bring_to_front(hwnd) -> bool:
     """hwnd 를 맨 앞(키보드 입력을 받는 창)으로 꺼낸다. 실제로 앞에 나왔으면 True.
 
     지금 앞에 있는 창의 스레드에도 붙어야 SetForegroundWindow 가 거절당하지 않는다
@@ -167,6 +422,8 @@ def require_front(hwnd, what: str) -> None:
     키 입력(Ctrl+V·Enter)은 «지금 앞에 있는 창»으로 간다. 앞에 꺼내기가 실패한 채 이어가면
     본문이 사용자가 쓰던 창(VS Code 등)에 붙거나, Enter 가 엉뚱한 곳에서 눌린다.
     """
+    if QUIET:
+        return            # 조용한 입력은 창이 뒤에 있어도 된다
     if bring_to_front(hwnd):
         return
     # 거절당했으면 Alt 를 한 번 눌렀다 떼고 다시 청한다 (포그라운드 잠금이 풀린다, 2026-09-11 실측 성공)
@@ -216,16 +473,81 @@ def ensure_main_ready(main_hwnd: int, pid: int, timeout: float = 2.0) -> int:
     return tree
 
 
-def click(x: int, y: int):
+# ── 마우스 — SendInput 으로만 보낸다 ─────────────────────────────────────────
+# ⚠️ 예전에는 win32api.mouse_event 를 썼는데, **2026-09-12 에 이 앱에 아예 안 닿게 됐다.**
+# 증상: 커서는 SetCursorPos 로 제자리에 가는데 눌러도 조직도 트리 선택(caret)이 **전혀 안 바뀌고**,
+# 전송창도 안 열렸다 (사람이 손으로 더블클릭하면 정상). 같은 자리를 SendInput 으로 누르니 바로 잡혔다.
+# 좌표가 틀린 게 아니었다 — 실측으로 목표 줄(280~302)을 겨냥해 285~318 어디를 눌러도 그 줄이 잡힌다.
+# 그래서 클릭은 전부 SendInput 으로 보내고, **누르기 전에 이동 이벤트(MOVE)를 같이 넣는다.**
+_MOUSEEVENTF_MOVE, _MOUSEEVENTF_ABSOLUTE = 0x0001, 0x8000
+_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
+_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP = 0x0008, 0x0010
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("extra", ctypes.POINTER(wintypes.ULONG))]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("pad", ctypes.c_byte * 32)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+
+def _send_mouse(flags: int, x: int = 0, y: int = 0) -> bool:
+    u32 = ctypes.windll.user32
+    ax = ay = 0
+    if flags & _MOUSEEVENTF_ABSOLUTE:
+        # 모니터 여러 대 — 가상 데스크톱 전체 기준으로 맞춘다 (SM_X/Y/CX/CYVIRTUALSCREEN)
+        vx, vy = u32.GetSystemMetrics(76), u32.GetSystemMetrics(77)
+        vw, vh = u32.GetSystemMetrics(78), u32.GetSystemMetrics(79)
+        ax = int((x - vx) * 65535 / max(vw - 1, 1))
+        ay = int((y - vy) * 65535 / max(vh - 1, 1))
+        flags |= 0x4000                               # MOUSEEVENTF_VIRTUALDESK
+    inp = _INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(ax, ay, 0, flags, 0, None)))
+    return u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) == 1
+
+
+def _mouse_to(x: int, y: int) -> None:
+    """커서를 옮긴다. SetCursorPos 만으로는 앱이 «지금 어느 줄 위인지»를 갱신하지 못해
+    이동 이벤트를 같이 보낸다."""
     win32api.SetCursorPos((x, y))
-    time.sleep(0.03)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-    time.sleep(0.03)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+    _send_mouse(_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE, x, y)
+
+
+def _press(down: int, up: int, times: int = 1, gap: float = 0.04) -> None:
+    for _ in range(times):
+        _send_mouse(down)
+        time.sleep(gap)
+        _send_mouse(up)
+        time.sleep(0.08)
+
+
+def click(x: int, y: int):
+    if QUIET:
+        _no_input("화면 좌표 클릭")
+    _mouse_to(x, y)
     time.sleep(0.06)
+    _press(_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP)
+    time.sleep(0.04)
+
+
+def double_click(x: int, y: int):
+    if QUIET:
+        _no_input("화면 좌표 더블클릭")
+    _mouse_to(x, y)
+    time.sleep(0.12)
+    _press(_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP, times=2)
 
 
 def click_hwnd(hwnd):
+    if QUIET:
+        post_click(hwnd)      # 그 컨트롤에만 가는 메시지 클릭
+        return
     r = win32gui.GetWindowRect(hwnd)
     click((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)
 
@@ -237,6 +559,8 @@ def paste_text(text: str, settle: float = 0.15):
     호출한 쪽에서 wait_control_text 로 확인한다. 본문(Chrome 기반 편집기)처럼
     읽어서 확인할 수 없는 곳만 settle 을 넉넉히 준다.
     """
+    if QUIET:
+        _no_input("Ctrl+V 붙여넣기")
     win32clipboard.OpenClipboard()
     win32clipboard.EmptyClipboard()
     win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
@@ -448,7 +772,11 @@ def _get_tree_item_screen_pos(proc_handle, tree_hwnd: int, hitem: int):
         _k32.WriteProcessMemory(proc_handle, remote,
                                 ctypes.addressof(hitem_val), ctypes.sizeof(hitem_val),
                                 ctypes.byref(written))
-        if not win32gui.SendMessage(tree_hwnd, TVM_GETITEMRECT, False, remote):
+        # ⚠️ wParam 은 **True(글자 칸)** 여야 한다. False 면 «줄 전체» 칸이 와서
+        # 가운데 x 가 이름 오른쪽 빈 자리에 떨어진다 — 눌러도 아무 일도 안 일어난다
+        # (2026-09-12 실측: 줄 전체 가운데 655 는 헛돌고, 글자 칸 가운데 588 은 바로 잡혔다.
+        #  트리 폭이 391~919 라 655 는 정확히 트리 한가운데 = 이름 끝 너머였다).
+        if not win32gui.SendMessage(tree_hwnd, TVM_GETITEMRECT, True, remote):
             return None
         rect = _RECT()
         read = ctypes.c_size_t(0)
@@ -529,14 +857,7 @@ def find_and_dblclick_tree_item(tree_hwnd: int, pid: int, name: str) -> bool:
         if not pos:
             return False
 
-        sx, sy = pos
-        win32api.SetCursorPos((sx, sy))
-        time.sleep(0.1)
-        for _ in range(2):
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-            time.sleep(0.04)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
-            time.sleep(0.08)
+        double_click(*pos)
         return True
     finally:
         _k32.CloseHandle(proc_handle)
@@ -767,6 +1088,15 @@ def open_send_dialog_for(main_hwnd: int, tree_hwnd: int, pid: int, name: str) ->
         dlg = _wait_for(lambda: get_send_dialog(pid), 3.0, 0.05)
         if dlg:
             return dlg
+        if QUIET:
+            # 진짜 마우스로 넘어가지 않고 메시지 더블클릭만 몇 번 더 (2026-11-12: 가끔 첫 번이 안 먹었다)
+            for _ in range(3):
+                win32gui.SendMessage(tree_hwnd, TVM_ENSUREVISIBLE, 0, target)
+                pos = _item_pos_settled(proc_handle, tree_hwnd, target) or pos
+                _post_dblclick(tree_hwnd, pos)
+                dlg = _wait_for(lambda: get_send_dialog(pid), 3.0, 0.05)
+                if dlg:
+                    return dlg
 
         # 메시지가 안 먹었을 때만 실제 마우스로 (예전 방식).
         # 더블클릭이 «그 줄에» 맞았는지 트리 선택(caret)으로 확인하고, 빗나갔으면 한 번 더 친다.
@@ -778,14 +1108,7 @@ def open_send_dialog_for(main_hwnd: int, tree_hwnd: int, pid: int, name: str) ->
             if cover != tree_hwnd:
                 raise RuntimeError("조직도의 '%s' 자리를 다른 창(%r)이 덮고 있어 누르지 않았습니다. "
                                    "그 창을 닫고 다시 시도해주세요." % (name, win32gui.GetWindowText(cover)))
-            sx, sy = pos
-            win32api.SetCursorPos((sx, sy))
-            time.sleep(0.2)
-            for _ in range(2):
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-                time.sleep(0.04)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
-                time.sleep(0.08)
+            double_click(*pos)
             dlg = _wait_for(lambda: get_send_dialog(pid), 4.0 if attempt == 0 else 8.0, 0.05)
             if dlg:
                 return dlg
@@ -802,7 +1125,7 @@ def open_send_dialog_for(main_hwnd: int, tree_hwnd: int, pid: int, name: str) ->
 #
 # 조직도 «검색»으로는 전체를 못 잡는다 — 검색 결과가 전부 Empty Name 으로 떠서
 # 더블클릭이 안 먹기 때문이다 (바로 위 「조직도 검색으로 수신자 고르기」 설명 참고).
-# 전체 발송은 **루트(조직도 맨 윗줄 = 학교 이름) 체크박스를 켜고 그 줄에서 우클릭 → 「메시지 보내기(M)」**
+# 전체 발송은 **루트(학교 이름) 체크박스를 켜고 그 줄에서 우클릭 → 「메시지 보내기(M)」**
 # 로만 된다. 2026-09-09에 이 경로로 73명에게 실제로 보냈다(연수 안내).
 #
 # ⚠️ 좌표를 상수로 박지 않는다. 창을 옮기면 바로 깨진다.
@@ -873,11 +1196,11 @@ def _tree_item_text_rect(proc_handle, tree_hwnd: int, hitem: int):
 
 
 def _right_click(x: int, y: int) -> None:
-    win32api.SetCursorPos((x, y))
+    if QUIET:
+        _no_input("전 교직원 발송(조직도 우클릭)")
+    _mouse_to(x, y)
     time.sleep(0.08)
-    win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0)
-    time.sleep(0.04)
-    win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0)
+    _press(_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP)
 
 
 def _visible_context_menu():
@@ -924,6 +1247,9 @@ def _click_menu_item(menu_hwnd: int, label: str) -> bool:
     win32gui.EnumChildWindows(menu_hwnd, cb, None)
     if not hit:
         return False
+    if QUIET:
+        post_click(hit[0])
+        return True
     l, t, r, b = win32gui.GetWindowRect(hit[0])
     click((l + r) // 2, (t + b) // 2)
     return True
@@ -955,6 +1281,35 @@ def _click_select_all_confirm(pid: int) -> bool:
     return True
 
 
+def _quiet_checked(tree_hwnd: int, x: int, y: int) -> bool:
+    """조직도 체크박스 켜짐 여부 — 화면 대신 트리 창 자체를 PrintWindow 로 찍어 본다 (가려져 있어도 된다)."""
+    im = _print_window(tree_hwnd)
+    if im is None:
+        return False
+    cx, cy = win32gui.ScreenToClient(tree_hwnd, (x, y))
+    px = im.load()
+    dark = 0
+    for yy in range(cy - 6, cy + 7):
+        for xx in range(cx - 6, cx + 7):
+            if 0 <= xx < im.size[0] and 0 <= yy < im.size[1]:
+                r, g, b = px[xx, yy]
+                if (r * 299 + g * 587 + b * 114) // 1000 < 140:
+                    dark += 1
+    return dark >= 5
+
+
+def _quiet_tree_click(tree_hwnd: int, x: int, y: int, right: bool = False) -> None:
+    """조직도에 메시지 클릭(화면 좌표 x,y → 트리 클라이언트 좌표). 진짜 커서는 안 움직인다."""
+    cx, cy = win32gui.ScreenToClient(tree_hwnd, (x, y))
+    if not right:
+        post_click(tree_hwnd, cx, cy)
+        return
+    win32gui.PostMessage(tree_hwnd, win32con.WM_MOUSEMOVE, 0, _lp(cx, cy))
+    win32gui.PostMessage(tree_hwnd, win32con.WM_RBUTTONDOWN, win32con.MK_RBUTTON, _lp(cx, cy))
+    time.sleep(0.05)
+    win32gui.PostMessage(tree_hwnd, win32con.WM_RBUTTONUP, 0, _lp(cx, cy))
+
+
 def open_send_dialog_for_all(main_hwnd: int, tree_hwnd: int, pid: int) -> int:
     """조직도 루트를 통째로 체크해 «전 교직원» 전송창을 연다."""
     clear_org_search(main_hwnd)
@@ -977,17 +1332,29 @@ def open_send_dialog_for_all(main_hwnd: int, tree_hwnd: int, pid: int) -> int:
 
         cbx = left - CHECKBOX_DX
         # 체크 여부를 «화면 픽셀»로 보고 실제 마우스로 누르므로, 그 자리를 다른 창이 덮고 있으면 둘 다 틀린다
-        cover = win32gui.WindowFromPoint((cbx, cy))
+        cover = tree_hwnd if QUIET else win32gui.WindowFromPoint((cbx, cy))
         if cover != tree_hwnd:
             raise RuntimeError("조직도 루트 자리를 다른 창(%r)이 덮고 있어 누르지 않았습니다. "
                                "그 창을 닫고 다시 시도해주세요." % win32gui.GetWindowText(cover))
-        if not _checkbox_is_checked(cbx, cy):
-            click(cbx, cy)
-            if not _wait_for(lambda: _checkbox_is_checked(cbx, cy), 2.0, 0.05):
+        is_on = (lambda: _quiet_checked(tree_hwnd, cbx, cy)) if QUIET else (lambda: _checkbox_is_checked(cbx, cy))
+        if not is_on():
+            if QUIET:
+                _quiet_tree_click(tree_hwnd, cbx, cy)
+            else:
+                click(cbx, cy)
+            if not _wait_for(is_on, 2.0, 0.05):
                 raise RuntimeError(
                     "조직도 루트 체크박스가 켜지지 않았습니다 — 전 교직원이 선택되지 않아 중단합니다.")
 
-        menu = _open_org_context_menu((left + right) // 2, cy)
+        if QUIET:
+            menu = None
+            for _ in range(3):
+                _quiet_tree_click(tree_hwnd, (left + right) // 2, cy, right=True)
+                menu = _wait_for(_visible_context_menu, 2.0, 0.05)
+                if menu:
+                    break
+        else:
+            menu = _open_org_context_menu((left + right) // 2, cy)
         if not menu:
             raise RuntimeError("조직도 우클릭 메뉴가 열리지 않았습니다.")
         if not _click_menu_item(menu, '메시지 보내기'):
@@ -1019,10 +1386,14 @@ def uncheck_org_root(tree_hwnd: int, pid: int) -> None:
             return
         left, top, _r, bottom = rect
         cbx, cy = left - CHECKBOX_DX, (top + bottom) // 2
-        if not _checkbox_is_checked(cbx, cy):
+        is_on = (lambda: _quiet_checked(tree_hwnd, cbx, cy)) if QUIET else (lambda: _checkbox_is_checked(cbx, cy))
+        if not is_on():
             return
-        click(cbx, cy)
-        _wait_for(lambda: not _checkbox_is_checked(cbx, cy), 1.5, 0.05)
+        if QUIET:
+            _quiet_tree_click(tree_hwnd, cbx, cy)
+        else:
+            click(cbx, cy)
+        _wait_for(lambda: not is_on(), 1.5, 0.05)
     finally:
         _k32.CloseHandle(proc_handle)
 
@@ -1145,6 +1516,11 @@ def _put_name_in_edit(edit_hwnd: int, name: str) -> bool:
     (2026-09-08 실측: 포커스는 정상인데 Ctrl+V 뒤 입력란이 빈 채였고, 그대로 Enter 를 쳐서
     수신자가 조용히 빠졌다). 그래서 넣은 뒤 반드시 읽어서 확인한다.
     """
+    if QUIET:
+        # 입력란 비우기 + 이름을 그 창에 WM_CHAR 로 (2026-11-12 실측: 자동완성까지 정상으로 뜬다)
+        win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, "")
+        post_chars(edit_hwnd, name)
+        return wait_control_text(edit_hwnd, name, 1.0)
     if not focus_control(edit_hwnd):
         click_hwnd(edit_hwnd)
         time.sleep(0.2)
@@ -1183,16 +1559,32 @@ def type_names_into(edit_hwnd: int, names: list, send_hwnd: int = 0) -> None:
             time.sleep(0.12 if got_popup else 0.35)
             if typed and name not in read_control_text(edit_hwnd):
                 continue          # 글자가 사라졌으면 Enter 치지 말고 다시 넣는다
-            win32api.keybd_event(0x28, 0, 0, 0)
-            win32api.keybd_event(0x28, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.06)
-            win32api.keybd_event(0x0D, 0, 0, 0)
-            win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
+            if QUIET:
+                post_key(edit_hwnd, 0x28, 0x50)      # ↓ (그 입력란에만)
+                time.sleep(0.1)
+                post_key(edit_hwnd, 0x0D, 0x1C)      # Enter
+            else:
+                win32api.keybd_event(0x28, 0, 0, 0)
+                win32api.keybd_event(0x28, 0, win32con.KEYEVENTF_KEYUP, 0)
+                time.sleep(0.06)
+                win32api.keybd_event(0x0D, 0, 0, 0)
+                win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
             if before is None:
                 time.sleep(0.35)
                 break
             if _wait_for(lambda: _chip_count(send_hwnd) > before, 1.5, 0.05):
                 break
+
+
+import re as _re
+
+_ATTACH_CHIP = _re.compile(r"\(\s*[\d.,]+\s*(B|KB|MB|GB)\s*\)\s*$", _re.I)
+
+
+def _is_attachment_chip(text: str) -> bool:
+    """첨부파일 칩(`점검표.hwp (38 KB)`)도 사람 칩과 같은 Afx: 클래스라 섞여 읽힌다.
+    그걸 «요청하지 않은 사람»으로 세서 발송을 막은 적이 있다 (2026-09-17 · 2026-09-30 실측)."""
+    return bool(_ATTACH_CHIP.search(text))
 
 
 def get_dialog_chips(send_hwnd: int) -> dict:
@@ -1218,7 +1610,7 @@ def get_dialog_chips(send_hwnd: int) -> dict:
     def cb(child, _):
         if win32gui.GetClassName(child).startswith('Afx:'):
             text = win32gui.GetWindowText(child)
-            if text:
+            if text and not _is_attachment_chip(text):
                 bucket = cc if win32gui.GetWindowRect(child)[1] >= line else to
                 if text not in bucket:
                     bucket.append(text)
@@ -1265,7 +1657,10 @@ def attach_files(send_hwnd: int, paths: list) -> int:
     win32api.SendMessage(name_edit, win32con.WM_SETTEXT, 0,
                          " ".join('"%s"' % p for p in paths))
     time.sleep(0.15)
-    click_hwnd(open_btn)
+    if QUIET:
+        win32gui.PostMessage(file_dlg, win32con.WM_COMMAND, win32con.IDOK, open_btn)   # 「열기」
+    else:
+        click_hwnd(open_btn)
 
     closed = _wait_for(
         lambda: not (win32gui.IsWindow(file_dlg) and win32gui.IsWindowVisible(file_dlg)),
@@ -1310,14 +1705,21 @@ def ensure_not_scheduled(send_hwnd: int) -> bool:
     _wait_for(lambda: win32gui.GetWindowText(b) != "", 1.5, 0.05)
     if not _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID):
         return False
-    bring_to_front(send_hwnd)
-    time.sleep(0.15)
-    click_hwnd(b)
+    if QUIET:
+        # 체크 네모가 있는 왼쪽 끝(x=8)을 누른다 — 2026-11-12 실측: 이 자리는 칩이 남았고, 가운데는 칩이 지워진 적이 있다
+        _, _, _, bh = win32gui.GetClientRect(b)
+        post_click(b, 8, bh // 2)
+    else:
+        bring_to_front(send_hwnd)
+        time.sleep(0.15)
+        click_hwnd(b)
     _wait_for(lambda: not _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID), 1.5, 0.05)
     return True
 
 
 def _key_combo(mod: int, key: int) -> None:
+    if QUIET:
+        _no_input("단축키")
     win32api.keybd_event(mod, 0, 0, 0)
     win32api.keybd_event(key, 0, 0, 0)
     time.sleep(0.03)
@@ -1333,6 +1735,58 @@ def set_clipboard_text(text: str) -> bool:
             try:
                 win32clipboard.EmptyClipboard()
                 win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+                return True
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            time.sleep(0.05)
+    return False
+
+
+_RED = _re.compile(r"\*\*(.+?)\*\*", _re.S)
+
+
+def body_markup(body: str):
+    """본문 속 `**중요한 말**` 을 빨간 굵은 글씨로 바꾼다. (평문, HTML|None) 을 돌려준다.
+
+    사용자는 쿨메신저 안내문에서 **마감일처럼 꼭 봐야 할 말을 빨간색(#ff0000)+굵게** 칠한다
+    (2026-09-30 9월분 근태신고서철 안내를 직접 고쳐 보낸 것에서 확인: `<font color="#ff0000"><b>10월 8일(목) 퇴청 전</b></font>까지`).
+    표시가 없으면 HTML 없이 예전처럼 평문만 붙인다.
+    """
+    import html as _html
+    plain = _RED.sub(lambda m: m.group(1), body)
+    if plain == body:
+        return body, None
+    out = []
+    last = 0
+    for m in _RED.finditer(body):
+        out.append(_html.escape(body[last:m.start()]))
+        out.append('<font color="#ff0000"><b>%s</b></font>' % _html.escape(m.group(1)))
+        last = m.end()
+    out.append(_html.escape(body[last:]))
+    lines = "".join(out).replace("\r\n", "\n").split("\n")
+    return plain, "".join("<div>%s</div>" % (ln if ln else "<br>") for ln in lines)
+
+
+def set_clipboard_html(plain: str, fragment: str) -> bool:
+    """클립보드에 HTML(CF_HTML)과 평문을 같이 넣는다. 본문 편집기(Chromium)는 HTML 쪽을 붙인다."""
+    head = ("Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\n"
+            "StartFragment:%010d\r\nEndFragment:%010d\r\n")
+    pre = "<html><body><!--StartFragment-->"
+    post = "<!--EndFragment--></body></html>"
+    h = len((head % (0, 0, 0, 0)).encode("utf-8"))
+    sf = h + len(pre.encode("utf-8"))
+    ef = sf + len(fragment.encode("utf-8"))
+    eh = ef + len(post.encode("utf-8"))
+    data = ((head % (h, eh, sf, ef)) + pre + fragment + post).encode("utf-8")
+    fmt = win32clipboard.RegisterClipboardFormat("HTML Format")
+    for _ in range(6):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(fmt, data)
+                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain)
                 return True
             finally:
                 win32clipboard.CloseClipboard()
@@ -1408,6 +1862,9 @@ def paste_body(send_hwnd: int, body: str) -> bool:
     - 붙여넣기 전에 Ctrl+A 를 친다: 앞 시도의 붙여넣기가 늦게 들어갔어도 **덮어써서** 두 번 붙지 않는다
     - 대조는 앞 20자가 아니라 공백을 정리한 **본문 전체가 똑같은지**로 한다 (잘림·중복·확인용 글자 섞임도 잡는다)
     """
+    if QUIET:
+        return quiet_paste_body(send_hwnd, body)
+    body, html_body = body_markup(body)
     want = " ".join(body.split())
     if not want:
         return False
@@ -1418,7 +1875,7 @@ def paste_body(send_hwnd: int, body: str) -> bool:
         # 포커스(GetGUIThreadInfo)로 기다려 보니 이 편집기에서는 한 번도 참이 안 나왔다 (둘 다 2026-09-11 실측).
         # 그래서 예전에 검증된 0.25초를 그대로 쓴다.
         time.sleep(0.25 + 0.3 * attempt)
-        if not set_clipboard_text(body):
+        if not (set_clipboard_html(body, html_body) if html_body else set_clipboard_text(body)):
             continue
         _key_combo(0x11, 0x41)        # Ctrl+A
         time.sleep(0.08)              # 단축키를 붙여 치면 편집기가 뒤엣것을 흘린다 (2026-09-11 실측, 예전 코드도 0.08 간격)
@@ -1477,8 +1934,122 @@ def _owner_name() -> str:
     return os.path.splitext(os.path.basename(max(files, key=os.path.getmtime)))[0]
 
 
-def send_coolmessenger_message(recipients: list, title: str, body: str,
-                               attachments=None, send: bool = True, cc=None) -> str:
+EMOTICON_BUTTON_ID = 1845     # 전송창 「이모티콘」 버튼
+EMOTICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emoticons")
+
+
+def _emoticon_popup(pid: int, send_hwnd: int):
+    """이모티콘 팝업 — 제목 없는 #32770 안에 AfxWnd140u 격자가 있는 창.
+    전송창·메인창도 AfxWnd140u 를 가지므로 «제목 없음»으로 가른다 (2026-10-15 실측)."""
+    found = []
+    def cb(h, _):
+        if (h != send_hwnd and win32gui.IsWindowVisible(h)
+                and win32gui.GetClassName(h) == "#32770" and not win32gui.GetWindowText(h)
+                and win32process.GetWindowThreadProcessId(h)[1] == pid
+                and find_child_by_class(h, "AfxWnd140u")):
+            found.append(h)
+    win32gui.EnumWindows(cb, None)
+    return found[0] if found else None
+
+
+def _match_template(shot, tpl):
+    """격자 캡처 안에서 tpl 이 있는 자리(가운데, 격자 좌표)와 평균 차이를 돌려준다. 반 해상도로 비교."""
+    import numpy as np
+    a = np.asarray(shot.convert("L"), dtype=np.float32)[::2, ::2]
+    t = np.asarray(tpl.convert("L"), dtype=np.float32)[::2, ::2]
+    if a.shape[0] < t.shape[0] or a.shape[1] < t.shape[1]:
+        return None, 999.0
+    win = np.lib.stride_tricks.sliding_window_view(a, t.shape)
+    diff = np.abs(win - t).mean(axis=(2, 3))
+    y, x = np.unravel_index(np.argmin(diff), diff.shape)
+    return ((x + t.shape[1] // 2) * 2, (y + t.shape[0] // 2) * 2), float(diff[y, x])
+
+
+def _print_window(hwnd):
+    """창 하나를 (가려져 있어도) 그 창 내용대로 찍는다. 실패하면 None."""
+    try:
+        _, _, w, h = win32gui.GetClientRect(hwnd)
+        hdc = win32gui.GetDC(hwnd)
+        dc = win32ui.CreateDCFromHandle(hdc)
+        mem = dc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(dc, w, h)
+        mem.SelectObject(bmp)
+        ok = ctypes.windll.user32.PrintWindow(hwnd, mem.GetSafeHdc(), 1 | 2)   # CLIENTONLY | RENDERFULLCONTENT
+        info = bmp.GetInfo()
+        im = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
+        mem.DeleteDC(); dc.DeleteDC(); win32gui.ReleaseDC(hwnd, hdc); win32gui.DeleteObject(bmp.GetHandle())
+        return im if ok else None
+    except Exception:
+        return None
+
+
+def insert_emoticon(send_hwnd: int, pid: int, name: str) -> str:
+    """본문 끝에 이모티콘을 넣는다 (마우스 안 씀). 성공하면 "", 아니면 경고 문구.
+
+    「최근사용」 탭은 순서가 바뀌므로 좌표가 아니라 emoticons/<name>.png 그림을 찾아 누른다.
+    """
+    from PIL import Image, ImageGrab
+    path = os.path.join(EMOTICON_DIR, name + ".png")
+    if not os.path.exists(path):
+        return "  ⚠️ 이모티콘 그림이 없습니다: " + name
+    tpl = Image.open(path)
+    btn = _find_child_by_id(send_hwnd, EMOTICON_BUTTON_ID)
+    if not btn:
+        return "  ⚠️ 이모티콘 버튼을 찾지 못했습니다"
+    bring_to_front(send_hwnd)
+    popup = None
+    for _ in range(2):   # 2026-11-02 교감 선생님께 보낼 때 창이 안 열렸다 — 한 번 더 눌러 본다
+        win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+        popup = _wait_for(lambda: _emoticon_popup(pid, send_hwnd), 3.0, 0.05)
+        if popup:
+            break
+    if not popup:
+        return "  ⚠️ 이모티콘 창이 열리지 않았습니다"
+    grid = find_child_by_class(popup, "AfxWnd140u")
+    time.sleep(0.3)   # 스티커 그림이 다 그려질 때까지
+    r = win32gui.GetWindowRect(grid)
+    # 전송창이 다른 창 뒤에 있으면 화면 캡처엔 덮은 창이 찍힌다 → 그 창 자체를 PrintWindow 로 찍는다
+    shot = _print_window(grid) if QUIET else None
+    pos, score = _match_template(shot or ImageGrab.grab(bbox=r, all_screens=True), tpl)
+    if pos is None or score > 20:
+        win32gui.PostMessage(popup, win32con.WM_CLOSE, 0, 0)
+        return "  ⚠️ 이모티콘 「%s」을 최근사용 탭에서 못 찾아 넣지 않았습니다 (차이 %.0f)" % (name, score)
+    lp = win32api.MAKELONG(pos[0], pos[1])
+    win32gui.PostMessage(grid, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
+    time.sleep(0.05)
+    win32gui.PostMessage(grid, win32con.WM_LBUTTONUP, 0, lp)
+    if not _wait_for(lambda: not win32gui.IsWindowVisible(popup), 2.0, 0.05):
+        return "  ⚠️ 이모티콘을 눌렀는데 창이 안 닫혔습니다 — 들어갔는지 확인해주세요"
+    return ""
+
+
+def send_coolmessenger_message(*args, **kw) -> str:
+    """발송하는 동안 쿨메신저가 앞(키보드)을 가져가면 0.05초 안에 원래 창으로 돌려준다 (QUIET 일 때)."""
+    if not QUIET:
+        return _send_coolmessenger_message(*args, **kw)
+    give_back = fg_guard()
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            try:
+                give_back()
+            except Exception:
+                pass
+            stop.wait(0.05)
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    try:
+        return _send_coolmessenger_message(*args, **kw)
+    finally:
+        stop.set()
+        t.join(0.5)
+        give_back()
+
+
+def _send_coolmessenger_message(recipients: list, title: str, body: str,
+                                attachments=None, send: bool = True, cc=None, emoticon=None) -> str:
     """쿨메신저 메시지를 작성한다.
 
     send=False 면 보내기를 누르지 않고 작성된 상태로 창을 남긴다 (사람이 확인 후 발송).
@@ -1515,6 +2086,7 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
         raise RuntimeError("수신자가 없습니다.")
 
     all_staff = _is_all_staff(recipients)
+    quiet_self = False
 
     if all_staff:
         # 전 교직원 — 조직도 루트를 통째로 체크해서 연다 (검색 경로로는 안 된다)
@@ -1549,7 +2121,15 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
                     % (recipients[0], got, attempt + 1, closed))
 
         # 「예약전송」은 **수신자를 채우기 전에** 끈다 (끄면 받는사람이 지워지기 때문 — 위 설명 참고)
-        wiped = ensure_not_scheduled(send_hwnd)
+        if QUIET:
+            # ⚠️ 전송창은 뜬 뒤 0.5초쯤 지나 스스로 「예약전송」을 켰다 껐다 한다 (2026-11-12 실측:
+            # 0.5초에 끈 것이 그 뒤 앱 초기화로 다시 켜져 10분 예약으로 나갔다). 체크 상태가 1초 동안 그대로일 때까지 기다린다
+            _settle_checks(send_hwnd)
+        quiet_self = (QUIET and len(recipients) == 1 and recipients[0] == _owner_name()
+                      and any(recipients[0] in c for c in get_dialog_chips(send_hwnd)["to"]))
+        # 나에게 보낼 때는 예약전송을 건드리지 않는다 — 끄면 받는사람(나)이 지워지고, 「나에게 보내기」를 켜면
+        # 예약전송이 다시 켜진다 (2026-11-12 실측, 순환). 켜진 채로 보내면 약 10분 뒤 도착한다 — 결과에 적는다
+        wiped = False if quiet_self else ensure_not_scheduled(send_hwnd)
 
     if title:
         title_edit = _find_child_by_id(send_hwnd, 4362, 'Edit')
@@ -1572,12 +2152,21 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
     self_send = False
     if (not all_staff and len(recipients) == 1 and recipients[0] == _owner_name()
             and not get_dialog_chips(send_hwnd)["to"]):
+        # ⚠️ 「나에게 보내기」를 누르면 그 아래 겹쳐 있는 「예약전송」이 **다시 켜진다**
+        # (2026-09-11 릴스 녹화 프레임으로 확인: 30초 프레임에서는 꺼져 있었는데 「나에게 보내기」를
+        #  누른 뒤 다시 켜져 있었고, 23:59에 누른 메시지가 예약 시각 00:09에 도착했다).
+        # 그래서 누른 «다음에» 예약전송을 다시 끄고, 끄면서 「나에게 보내기」가 풀렸으면 다시 켠다.
+        # 자기 자신에게 보낼 때는 받는사람 칩이 원래 비어 있으므로 예약전송을 꺼도 지워질 칩이 없다.
         btn = _find_child_by_id(send_hwnd, SELF_COPY_BUTTON_ID)
-        if btn and not _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID):
-            bring_to_front(send_hwnd)
-            time.sleep(0.15)
-            click_hwnd(btn)
-            _wait_for(lambda: _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID), 1.5, 0.05)
+        for _ in range(3):
+            if btn and not _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID):
+                bring_to_front(send_hwnd)
+                time.sleep(0.15)
+                click_hwnd(btn)
+                _wait_for(lambda: _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID), 1.5, 0.05)
+            if not _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID):
+                break
+            ensure_not_scheduled(send_hwnd)
         self_send = _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID)
 
     # 참조는 받는사람을 다 넣은 **뒤에** 연다 (같은 id를 쓰는 입력란이 둘이 되기 때문)
@@ -1589,6 +2178,8 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
     attached = 0
     if attachments:
         attached = attach_files(send_hwnd, attachments)
+
+    emo_warn = insert_emoticon(send_hwnd, pid, emoticon) if (emoticon and body_ok) else ""
 
     clear_org_search(main_hwnd)
 
@@ -1603,6 +2194,12 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
     if cc:
         summary += " / 참조 %d명 %s" % (len(chips["cc"]), chips["cc"])
     summary += ", 첨부 %d개" % attached
+    if emoticon:
+        summary += emo_warn or (", 이모티콘 「%s」" % emoticon)
+    bold_missed = list(getattr(_BOLD, "missed", None) or [])
+    _BOLD.missed = []
+    if bold_missed:
+        summary += "  ⚠️ 굵게 못 한 말: %s — 전송창에서 직접 굵게 한 뒤 보내 주세요" % bold_missed
 
     # 요청한 사람이 «그 줄(받는사람/참조)에» 실제로 들어갔는지, 요청 안 한 사람이 끼었는지 줄별로 대조한다.
     # 예전에는 못 넣은 이름을 경고만 하고 그대로 보냈다 (코덱스 검토 2026-09-11) — 이제 발송을 막는다.
@@ -1634,9 +2231,42 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
     if not send:
         return "[작성 완료 / 보내지 않음] " + summary + ". 내용 확인 후 보내기를 눌러주세요."
 
-    if not body_ok or not (chips["to"] or self_send) or missing or unexpected:
+    # 이모티콘을 달라고 했는데 못 넣었으면 빼고 보내지 않는다 (2026-11-02 사용자 «결재 부탁엔 꼭»).
+    if not body_ok or not (chips["to"] or self_send) or missing or unexpected or emo_warn or bold_missed:
         return ("[중단] 전송창이 제대로 채워지지 않아 보내지 않았습니다. "
                 "전송창은 열어 두었으니 확인해주세요. " + summary)
+
+    # ⚠️ 「예약전송」을 **보내기 직전에 한 번 더 본다** (2026-09-12).
+    # 앞에서 껐어도 다시 켜져 있을 수 있다 — 2026-09-11 「나에게 보내기」 녹화에서 실제로 그랬다
+    # (SELF_COPY_BUTTON_ID 를 누른 뒤 예약전송이 되살아나, 23:59:50 께 누른 것이 00:09 에 도착했다).
+    if quiet_self and _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID):
+        summary += "  (나에게 보내기라 예약전송이 켜진 채 나갑니다 — 약 10분 뒤 도착)"
+    elif _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID):
+        if (chips["to"] or chips["cc"]) and not self_send:
+            # 받는사람이 칩으로 들어가 있으면 여기서 끌 수 없다 — 끄면 칩이 통째로 지워진다
+            # (ensure_not_scheduled 설명 참고). 조용히 예약으로 내보내지 말고 멈춘다.
+            return ("[중단] 보내기 직전에 보니 「예약전송」이 켜져 있습니다 — 지금 눌러도 그 자리에서 "
+                    "안 나가고 예약 시각까지 묶입니다. 전송창은 열어 두었으니 「예약전송」을 직접 끄고 "
+                    "보내주세요. " + summary)
+        # 「나에게 보내기」는 그 체크만으로 본인에게 간다 — 칩이 지워져도 잃을 것이 없으므로 그 자리에서 끈다.
+        # 둘이 서로를 되살릴 수 있어(오너드로우 버튼이 겹쳐 있다) 몇 번만 번갈아 맞춘다.
+        for _ in range(3):
+            if _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID):
+                ensure_not_scheduled(send_hwnd)
+            if self_send and not _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID):
+                btn = _find_child_by_id(send_hwnd, SELF_COPY_BUTTON_ID)
+                if btn:
+                    bring_to_front(send_hwnd)
+                    time.sleep(0.15)
+                    click_hwnd(btn)
+                    _wait_for(lambda: _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID), 1.5, 0.05)
+            if (not _checkbox_on(send_hwnd, SCHEDULE_BUTTON_ID)
+                    and (not self_send or _checkbox_on(send_hwnd, SELF_COPY_BUTTON_ID))):
+                break
+        else:
+            return ("[중단] 「예약전송」과 「나에게 보내기」가 서로 되살아나 맞추지 못했습니다. "
+                    "전송창은 열어 두었으니 화면에서 확인해주세요. " + summary)
+        summary += "  (보내기 직전에 다시 켜져 있던 '예약전송'을 껐습니다)"
 
     send_btn = find_child_by_text(send_hwnd, '보내기') or _find_child_by_id(send_hwnd, 3249)
     if not send_btn:
@@ -1668,12 +2298,18 @@ def send_coolmessenger_message(recipients: list, title: str, body: str,
 # ── MCP 도구 등록 ────────────────────────────────────────────────────────────
 
 _SEND_LOCK = threading.Lock()
+# 한 번 발송이 이보다 오래 걸리면 어딘가 멈춘 것이다 — 세션이 무한정 기다리지 않게 오류로 돌려준다.
+SEND_TIMEOUT = 120
 
 
 def _send_serialized(*args) -> str:
     """발송은 한 번에 하나만 — 전송창·클립보드·키보드를 전부 같이 쓰기 때문이다."""
-    with _SEND_LOCK:
+    if not _SEND_LOCK.acquire(timeout=10):
+        raise RuntimeError("이전 발송이 멈춘 채 남아 있습니다. 쿨메신저 전송창을 확인하고 클로드 창을 새로 열어 주세요.")
+    try:
         return send_coolmessenger_message(*args)
+    finally:
+        _SEND_LOCK.release()
 
 
 @server.list_tools()
@@ -1697,7 +2333,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "body": {
                         "type": "string",
-                        "description": "메시지 본문 (줄바꿈 \\n 가능)",
+                        "description": "메시지 본문 (줄바꿈 \\n 가능). 마감일처럼 꼭 봐야 할 말은 **이렇게** 감싸면 굵은 글씨로 들어간다(빨간색은 아직 안 됨) — 날짜·기한은 항상 이렇게 표시한다",
                     },
                     "attachments": {
                         "type": "array",
@@ -1708,6 +2344,10 @@ async def list_tools() -> list[types.Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "참조로 넣을 이름 목록 (예: ['교감', '교장']). 받는사람을 다 넣은 뒤 참조 행이 열린다",
+                    },
+                    "emoticon": {
+                        "type": "string",
+                        "description": "본문 끝에 넣을 이모티콘 이름 (선택). 지금 있는 것: '감사합니다'(물개). 부탁·감사 메시지에 쓴다. 그림은 emoticons/<이름>.png",
                     },
                     "send": {
                         "type": "boolean",
@@ -1728,7 +2368,7 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "send_coolmessenger":
         try:
-            result = await asyncio.to_thread(
+            result = await asyncio.wait_for(asyncio.to_thread(
                 _send_serialized,
                 arguments["recipients"],
                 arguments["title"],
@@ -1736,8 +2376,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments.get("attachments"),
                 arguments.get("send", True),
                 arguments.get("cc"),
-            )
+                arguments.get("emoticon"),
+            ), timeout=SEND_TIMEOUT)
             return [types.TextContent(type="text", text=result)]
+        except asyncio.TimeoutError:
+            return [types.TextContent(type="text", text=(
+                f"❌ {SEND_TIMEOUT}초가 지나도 발송이 끝나지 않아 기다리기를 멈췄습니다. "
+                "보내졌는지 「메시지 관리함 > 보낸메시지」에서 확인하고, 다시 보내지 말고 사용자에게 알리세요."))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"❌ 오류: {e}")]
 

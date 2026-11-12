@@ -122,7 +122,33 @@ def child_by(hwnd, cls=None, text_has=None, visible=True):
     return None
 
 
+# 조용한 입력 (2026-11-12, 사용자 «내가 마우스 쓰고 있잖아») — 진짜 마우스·키보드를 안 쓰고
+# 그 창에만 가는 메시지로 누른다. 창을 앞으로 꺼내지도 않는다. 옛 방식은 COOL_ALLOW_INPUT=1
+QUIET = os.environ.get("COOL_ALLOW_INPUT") != "1"
+
+
+def post_click(h, x=None, y=None):
+    _, _, r, b = win32gui.GetClientRect(h)
+    x = r // 2 if x is None else x
+    y = b // 2 if y is None else y
+    lp = win32api.MAKELONG(max(0, x), max(0, y))
+    win32gui.PostMessage(h, win32con.WM_MOUSEMOVE, 0, lp)
+    time.sleep(0.03)
+    win32gui.PostMessage(h, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
+    time.sleep(0.05)
+    win32gui.PostMessage(h, win32con.WM_LBUTTONUP, 0, lp)
+    time.sleep(0.35)
+
+
 def bring_to_front(h):
+    if QUIET:
+        if u32.IsIconic(h):
+            u32.ShowWindowAsync(h, 4)      # SW_SHOWNOACTIVATE — 최소화만 풀고 앞으로는 안 꺼낸다
+        return
+    _bring_to_front(h)
+
+
+def _bring_to_front(h):
     cur = k32.GetCurrentThreadId()
     tid = u32.GetWindowThreadProcessId(h, None)
     u32.AttachThreadInput(cur, tid, True)
@@ -134,6 +160,8 @@ def bring_to_front(h):
 
 
 def click_at(x, y):
+    if QUIET:
+        raise SystemExit("화면 좌표 클릭은 진짜 마우스가 필요해서 멈췄다 (COOL_ALLOW_INPUT=1 로 옛 방식)")
     win32api.SetCursorPos((x, y))
     time.sleep(0.10)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
@@ -143,6 +171,9 @@ def click_at(x, y):
 
 
 def click_hwnd(h):
+    if QUIET:
+        post_click(h)
+        return
     r = win32gui.GetWindowRect(h)
     click_at((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)
 
@@ -195,6 +226,9 @@ class ListReader:
         r = ctypes.c_size_t(0)
         k32.ReadProcessMemory(self.h, self.rem + self.TB, ctypes.addressof(out),
                               ctypes.sizeof(out), ctypes.byref(r))
+        if QUIET:
+            post_click(self.lv, (out.left + out.right) // 2, (out.top + out.bottom) // 2)
+            return
         pt = POINT((out.left + out.right) // 2, (out.top + out.bottom) // 2)
         u32.ClientToScreen(self.lv, ctypes.byref(pt))
         click_at(pt.x, pt.y)
@@ -209,7 +243,9 @@ class ListReader:
 
 def open_manager(pid):
     """(관리함 hwnd, 우리가 열었는지, 메인창이 원래 최소화였는지)"""
-    existing = windows_of(pid, title="메시지 관리함", cls="#32770")
+    # 관리함 제목은 안읽은 게 있으면 「N개의 안읽은 메시지」로 바뀐다 → 안의 메시지 리스트로 찾는다
+    existing = [h for h in windows_of(pid, cls="#32770")
+                if child_by(h, cls="SysListView32", text_has="메시지 리스트")]
     mains = windows_of(pid, title="COOLMESSENGER", cls="#32770")
     if not mains:
         raise SystemExit("쿨메신저 메인 창을 못 찾았다. 로그인 상태인지 확인할 것.")
@@ -224,7 +260,8 @@ def open_manager(pid):
         raise SystemExit("메인 창에서 '메시지관리함 열기' 버튼을 못 찾았다.")
     click_hwnd(btn)
     for _ in range(40):
-        got = windows_of(pid, title="메시지 관리함", cls="#32770")
+        got = [h for h in windows_of(pid, cls="#32770")
+               if child_by(h, cls="SysListView32", text_has="메시지 리스트")]
         if got:
             time.sleep(0.8)
             return got[0], True, was_min
@@ -291,7 +328,9 @@ def handle_popups(pid, expected, timeout=180):
                    if not os.path.exists(os.path.join(cool.DOWNLOAD_DIR, n))]
         if not acted:
             quiet += 1
-            if not missing or quiet >= 6:
+            # 큰 파일은 '파일 다운로드 중' 창이 4~5초 뒤에야 뜬다 (2026-09-30, 34MB+91MB)
+            # → 받을 게 남아 있으면 조용해도 15초는 기다린다
+            if not missing or quiet >= 24:
                 return
         else:
             quiet = 0
@@ -381,6 +420,11 @@ def download(msgs, dry_run=False, keep_open=False):
             time.sleep(1.0)
 
             labels = attachment_labels(mgr)
+            for _ in range(24):           # 패널이 늦게 뜨는 때가 있다 (10/26: 1초로는 부족, 11/11: 4초도 부족)
+                if labels:
+                    break
+                time.sleep(0.25)
+                labels = attachment_labels(mgr)
             want = [a["name"] for a in m["attachments"]]
             if not labels:
                 print("    ! 첨부 패널이 안 뜬다 — 건너뜀")
@@ -431,6 +475,67 @@ def download(msgs, dry_run=False, keep_open=False):
     return done
 
 
+import contextlib
+import threading
+
+
+@contextlib.contextmanager
+def _keep_foreground():
+    """받는 동안 쿨메신저(또는 저장 뒤 뜨는 탐색기)가 앞을 가져가면 원래 창으로 돌려준다."""
+    orig = u32.GetForegroundWindow()
+    stop = threading.Event()
+    before = set()                      # 시작할 때 이미 있던 탐색기 창 — 선생님 것이라 건드리지 않는다
+
+    def _collect(h, _):
+        try:
+            if win32gui.GetClassName(h) in ("CabinetWClass", "ExploreWClass"):
+                before.add(h)
+        except BaseException:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_collect, None)
+    except BaseException:
+        pass
+
+    def give_back():
+        fg = u32.GetForegroundWindow()
+        if not orig or fg == orig or not win32gui.IsWindow(orig):
+            return
+        _, p = win32process.GetWindowThreadProcessId(fg)
+        try:
+            mine = p == find_pid() or (fg not in before
+                                       and win32gui.GetClassName(fg) in ("CabinetWClass", "ExploreWClass"))
+        except BaseException:
+            mine = False
+        if not mine:
+            return
+        cur = k32.GetCurrentThreadId()
+        t = u32.GetWindowThreadProcessId(fg, None)
+        u32.AttachThreadInput(cur, t, True)
+        try:
+            u32.SetForegroundWindow(orig)
+        finally:
+            u32.AttachThreadInput(cur, t, False)
+
+    def watch():
+        while not stop.is_set():
+            try:
+                give_back()
+            except BaseException:
+                pass
+            stop.wait(0.05)
+    th = threading.Thread(target=watch, daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join(0.5)
+        give_back()
+
+
 def main():
     ap = argparse.ArgumentParser(description="쿨메신저 첨부 내려받기")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -449,7 +554,11 @@ def main():
     else:
         since, after_key = cool.resolve_window(args)
         msgs = cool.fetch(since=since, after_key=after_key, limit=args.limit)
-    download(msgs, dry_run=args.dry_run, keep_open=args.keep_open)
+    if QUIET and not args.dry_run:
+        with _keep_foreground():
+            download(msgs, dry_run=args.dry_run, keep_open=args.keep_open)
+    else:
+        download(msgs, dry_run=args.dry_run, keep_open=args.keep_open)
 
 
 if __name__ == "__main__":
