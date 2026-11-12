@@ -149,7 +149,8 @@ def get_window_by_title(pid: int, title: str):
 #   · 「예약전송」 오너드로우 체크: 메시지 클릭(WM_LBUTTONDOWN/UP)으로 꺼진다, 칩도 안 지워진다
 #     (UIA Invoke 는 되지만 전송창이 앞으로 튀어나와 키보드를 뺏는다 → 쓰지 않는다)
 #   · 굵게: 범위를 메시지 드래그로 고르고 「진하게」 버튼에 메시지 클릭 → 된다
-#   · ⚠️ 빨간색은 아직 안 된다 — 색 팔레트가 진짜 커서 위치(GetCursorPos)로 칸을 고르는 듯, 메시지 클릭은 닫히기만 한다
+#   · 빨간색: 「텍스트 색」 팔레트는 메시지 클릭을 진짜 커서 위치로 판정해 닫히기만 한다.
+#     대신 WM_MOUSEMOVE 로 빨간 칸에 올려 두고 WM_KEYDOWN Enter 를 보내면 골라진다 → _red_span
 #   · UIA SetValue·WM_PASTE 는 본문에 안 먹는다 (둘 다 실측)
 # 진짜 입력이 필요한 옛 경로(전 교직원 발송 등)는 QUIET 일 때 InputNeeded 로 멈춘다.
 # 꼭 옛 방식이 필요하면 환경변수 COOL_ALLOW_INPUT=1.
@@ -265,22 +266,22 @@ def _focus_body_end(send_hwnd: int) -> int:
     return rw
 
 
-def _bold_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
-    """본문에서 span 을 메시지 드래그로 골라 「진하게」를 누른다. 굵게 됐으면 True."""
+def _select_span(send_hwnd: int, span: str, occurrence: int = 0):
+    """본문에서 span(occurrence 번째)을 메시지 드래그로 고른다. 골라졌으면 그 TextRange, 아니면 None."""
     tp = _body_textpattern(send_hwnd)
     if not tp:
-        return False
+        return None
     rg = tp.DocumentRange
     found = None
     for _ in range(occurrence + 1):
         found = rg.FindText(span, 0, 0)
         if not found:
-            return False
+            return None
         rg = tp.DocumentRange
         rg.MoveEndpointByRange(0, found, 1)    # 다음 찾기는 이 뒤부터 (Start ← found.End)
     rects = list(found.GetBoundingRectangles())
     if len(rects) < 4:
-        return False
+        return None
     rw = find_body_target(send_hwnd)
     first, last = rects[:4], rects[-4:]
     p1 = win32gui.ScreenToClient(rw, (int(first[0]) + 1, int(first[1] + first[3] / 2)))
@@ -288,6 +289,14 @@ def _bold_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
     post_drag(rw, p1, p2)
     sel = tp.GetSelection()
     if not sel.Length or _norm(sel.GetElement(0).GetText(-1)) != _norm(span):
+        return None
+    return found
+
+
+def _bold_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
+    """본문에서 span 을 메시지 드래그로 골라 「진하게」를 누른다. 굵게 됐으면 True."""
+    found = _select_span(send_hwnd, span, occurrence)
+    if not found:
         return False
     post_click(_find_child_by_id(send_hwnd, 70001))       # 「진하게」
     time.sleep(0.2)
@@ -297,9 +306,56 @@ def _bold_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
         return False
 
 
+def _color_popup(pid: int):
+    """「텍스트 색」을 누르면 뜨는 팔레트 창(제목 CColorPopup)."""
+    out = []
+
+    def cb(w, _):
+        if (win32gui.IsWindowVisible(w) and win32gui.GetWindowText(w) == "CColorPopup"
+                and win32process.GetWindowThreadProcessId(w)[1] == pid):
+            out.append(w)
+    win32gui.EnumWindows(cb, None)
+    return out[0] if out else 0
+
+
+def _red_span(send_hwnd: int, span: str, occurrence: int = 0) -> bool:
+    """span 을 빨간색(#ff0000)으로. 진짜 마우스·키보드 없이 한다 (2026-11-12 실측):
+    팔레트(MFC CColorPopup)는 메시지 클릭을 «진짜 커서 위치»로 판정해 닫히기만 하지만,
+    WM_MOUSEMOVE(메시지) 로 빨간 칸에 «올려 두고» WM_KEYDOWN Enter 를 보내면 그 칸이 골라진다.
+    (방향키는 안 먹었다.) 빨간 칸 자리는 팔레트를 PrintWindow 로 찍어 순수 빨강 픽셀로 찾는다."""
+    found = _select_span(send_hwnd, span, occurrence)
+    if not found:
+        return False
+    pid = win32process.GetWindowThreadProcessId(send_hwnd)[1]
+    post_click(_find_child_by_id(send_hwnd, 70005), 6, 10)   # 「텍스트 색」 → 팔레트
+    pop = _wait_for(lambda: _color_popup(pid), 1.5, 0.05)
+    if not pop:
+        return False
+    time.sleep(0.15)
+    img = _print_window(pop)
+    pts = []
+    if img:
+        img = img.convert("RGB")
+        pts = [(x, y) for x in range(img.width) for y in range(img.height) if img.getpixel((x, y)) == (255, 0, 0)]
+    if not pts:
+        win32gui.PostMessage(pop, win32con.WM_KEYDOWN, 0x1B, 1 | (0x01 << 16))   # 못 찾았으면 팔레트 닫기(Esc)
+        return False
+    wx, wy = sum(p[0] for p in pts) // len(pts), sum(p[1] for p in pts) // len(pts)
+    l, t = win32gui.GetWindowRect(pop)[:2]
+    cx, cy = win32gui.ScreenToClient(pop, (l + wx, t + wy))
+    win32gui.PostMessage(pop, win32con.WM_MOUSEMOVE, 0, _lp(cx, cy))
+    time.sleep(0.2)
+    win32gui.PostMessage(pop, win32con.WM_KEYDOWN, 0x0D, 1 | (0x1C << 16))
+    _wait_for(lambda: not _color_popup(pid), 1.0, 0.05)
+    try:
+        return int(found.GetAttributeValue(40008)) == 0x0000FF   # ForegroundColor (COLORREF = BGR)
+    except Exception:
+        return False
+
+
 def quiet_paste_body(send_hwnd: int, body: str) -> bool:
     """본문을 메시지로만 넣는다. **본문 전체가 실제로 들어갔는지** UIA 로 되읽어 확인한다.
-    `**강조**` 는 굵게만 한다 (빨간색은 아직 못 한다 — 위 「조용한 입력」 설명)."""
+    `**강조**` 는 빨간 굵은 글씨로 (_bold_span → _red_span)."""
     plain, _html = body_markup(body)
     # (강조할 말, 평문에서 그 말이 몇 번째로 나오는지). 표시 없이 앞에 같은 말이 있어도 맞는 자리를 고른다
     spans = []
@@ -329,6 +385,14 @@ def quiet_paste_body(send_hwnd: int, body: str) -> bool:
             time.sleep(0.3)
         else:
             _BOLD.missed.append(s)     # 세 번 다 안 됐다 — 보내는 쪽에서 멈춘다
+            continue
+        for _try in range(3):          # 빨간색도 같은 식으로 되묻고 다시
+            if _red_span(send_hwnd, s, nth):
+                break
+            _focus_body_end(send_hwnd)
+            time.sleep(0.3)
+        else:
+            _BOLD.missed.append(s + " (빨간색)")
     if spans:
         _focus_body_end(send_hwnd)   # 선택 풀기 + 커서를 끝으로 (이모티콘이 끝에 붙게)
     return _norm(_body_text(send_hwnd)) == want
@@ -2199,7 +2263,7 @@ def _send_coolmessenger_message(recipients: list, title: str, body: str,
     bold_missed = list(getattr(_BOLD, "missed", None) or [])
     _BOLD.missed = []
     if bold_missed:
-        summary += "  ⚠️ 굵게 못 한 말: %s — 전송창에서 직접 굵게 한 뒤 보내 주세요" % bold_missed
+        summary += "  ⚠️ 굵게·빨간색 못 한 말: %s — 전송창에서 직접 칠한 뒤 보내 주세요" % bold_missed
 
     # 요청한 사람이 «그 줄(받는사람/참조)에» 실제로 들어갔는지, 요청 안 한 사람이 끼었는지 줄별로 대조한다.
     # 예전에는 못 넣은 이름을 경고만 하고 그대로 보냈다 (코덱스 검토 2026-09-11) — 이제 발송을 막는다.
@@ -2333,7 +2397,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "body": {
                         "type": "string",
-                        "description": "메시지 본문 (줄바꿈 \\n 가능). 마감일처럼 꼭 봐야 할 말은 **이렇게** 감싸면 굵은 글씨로 들어간다(빨간색은 아직 안 됨) — 날짜·기한은 항상 이렇게 표시한다",
+                        "description": "메시지 본문 (줄바꿈 \\n 가능). 마감일처럼 꼭 봐야 할 말은 **이렇게** 감싸면 빨간 굵은 글씨로 들어간다 — 날짜·기한은 항상 이렇게 표시한다",
                     },
                     "attachments": {
                         "type": "array",
